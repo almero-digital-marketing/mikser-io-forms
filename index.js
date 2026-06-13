@@ -240,7 +240,7 @@ function makeEndpointHandler({
     const upload = multer({
         storage: multer.memoryStorage(),
         limits: {
-            fileSize:    uploadsCfg?.maxBytes ?? 5 * 1024 * 1024,
+            fileSize:    uploadsCfg?.maxFileSize ?? 5 * 1024 * 1024,
             files:       uploadsCfg?.maxFiles ?? 0,
         },
         fileFilter(req, file, cb) {

@@ -441,7 +441,7 @@ describe('forms — multipart uploads', () => {
                     uploads: {
                         folder: (data) => `contact/${data.id}`,
                         name:   (data, { originalName }) => originalName,
-                        maxBytes: 1024 * 1024,
+                        maxFileSize: 1024 * 1024,
                         maxFiles: 2,
                     },
                 },
@@ -470,6 +470,31 @@ describe('forms — multipart uploads', () => {
             // Upload bytes on disk
             const file = await readFile(path.join(h.filesFolder, 'contact/abc/photo.png'))
             assert.equal(file.toString(), 'photo bytes')
+        } finally { await h.close() }
+    })
+
+    it('files larger than maxFileSize are rejected', async () => {
+        const h = await bootForms({
+            endpoints: {
+                contact: {
+                    folder: 'contact',
+                    name:   'sub',
+                    uploads: {
+                        folder: 'contact',
+                        name: (d, { originalName }) => originalName,
+                        maxFileSize: 100,   // 100 bytes — easy to exceed
+                    },
+                },
+            },
+        })
+        try {
+            const fd = new FormData()
+            fd.append('attachment', new Blob([Buffer.alloc(500, 'x')], { type: 'image/png' }), 'big.png')
+            const res = await fetch(`${h.url}/forms/contact`, {
+                method: 'POST',
+                body: fd,
+            })
+            assert.notEqual(res.status, 201)
         } finally { await h.close() }
     })
 

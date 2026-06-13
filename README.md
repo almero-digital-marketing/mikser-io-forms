@@ -81,7 +81,7 @@ export default {
                         // Per-file name. (data, { field, originalName, mimeType, size }) => string.
                         name: (data, { field, originalName }) =>
                             `${slugify(data.email)}-${field}-${originalName}`,
-                        maxBytes:     5 * 1024 * 1024,
+                        maxFileSize:     5 * 1024 * 1024,
                         maxFiles:     3,
                         allowedMimes: ['image/jpeg', 'image/png', 'application/pdf'],
                     },
