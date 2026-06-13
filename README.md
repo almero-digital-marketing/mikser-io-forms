@@ -81,8 +81,8 @@ export default {
                         // Per-file name. (data, { field, originalName, mimeType, size }) => string.
                         name: (data, { field, originalName }) =>
                             `${slugify(data.email)}-${field}-${originalName}`,
-                        maxFileSize:     5 * 1024 * 1024,
-                        maxFiles:     3,
+                        maxFileSize:  5 * 1024 * 1024,         // per file; default 100 MB
+                        maxFiles:     3,                         // total files per submission
                         allowedMimes: ['image/jpeg', 'image/png', 'application/pdf'],
                     },
 
