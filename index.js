@@ -1,7 +1,7 @@
 import path from 'node:path'
 import { mkdir, writeFile } from 'node:fs/promises'
 import YAML from 'yaml'
-import { isLoopback } from 'mikser-io'
+import { isLoopback, registerRoute } from 'mikser-io'
 
 // mikser-io-forms — public form-submission endpoints. POST → validation
 // + captcha → write a document file + per-submission uploaded files.
@@ -220,11 +220,25 @@ export function forms(options = {}) {
             }
 
             app.use(base, router)
-            const location = runtime.options.port
-                ? `http://localhost:${runtime.options.port}${base}/<name>`
-                : `${base}/<name>`
-            logger.info('Forms mounted: %s (endpoints: %s)',
-                location, Object.keys(endpoints).join(', '))
+            // One /forms mount, heterogeneous per-endpoint auth (same
+            // three states as api/mcp). Reduce to the most-exposed
+            // endpoint so a facade knows whether the path must be
+            // proxied at all: any remote-open-without-token → public;
+            // else any token → token; else loopback-only. Non-streaming.
+            const eps = Object.values(endpoints)
+            const reachability =
+                  eps.some(ep => ep.allowRemote && !ep.token) ? 'public'
+                : eps.some(ep => ep.token)                    ? 'token'
+                : 'loopback'
+            registerRoute({
+                path:        base,
+                plugin:      'forms',
+                reachability,
+                streaming:   false,
+                label:       'Forms',
+                detail:      `(endpoints: ${Object.keys(endpoints).join(', ')})`,
+                displayPath: `${base}/<name>`,
+            })
         })
     }
 }
