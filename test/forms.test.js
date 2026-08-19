@@ -140,6 +140,94 @@ describe('forms — auth', () => {
             assert.equal(res.status, 201)
         } finally { await h.close() }
     })
+
+    it('token set + none presented + loopback → accept (BEHAVIOUR CHANGE)', async () => {
+        // This used to 401. Forms hand-rolled the rule and required the
+        // token even from localhost, while api and mcp let loopback through
+        // — the "trusted local host" model. All three now share one
+        // implementation (ADR-0012) and this is the shared answer.
+        const h = await bootForms({
+            endpoints: { x: { folder: 'x', name: 'one', token: 'secret' } },
+        })
+        try {
+            const res = await fetch(`${h.url}/forms/x`, {
+                method: 'POST',
+                headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ a: 1 }),
+            })
+            assert.equal(res.status, 201)
+        } finally { await h.close() }
+    })
+
+    it('a wrong token is refused even from loopback, and challenges', async () => {
+        // The bypass this guards: "presented but wrong" must never fall
+        // through to the loopback allowance the way "not presented" does.
+        const h = await bootForms({
+            endpoints: { x: { folder: 'x', name: 'one', token: 'secret' } },
+        })
+        try {
+            const res = await fetch(`${h.url}/forms/x`, {
+                method: 'POST',
+                headers: { 'content-type': 'application/json', authorization: 'Bearer wrong' },
+                body: JSON.stringify({ a: 1 }),
+            })
+            assert.equal(res.status, 401)
+            assert.equal(res.headers.get('www-authenticate'), 'Bearer')
+        } finally { await h.close() }
+    })
+
+    it('accepts a verifier on `auth`, and gives it no loopback bypass', async () => {
+        // A real verifier is not a shared secret keeping the internet out —
+        // it gates every caller, localhost included.
+        const verifier = {
+            name: 'test',
+            async verify(req) {
+                const h = req.headers.authorization
+                if (!h) return null
+                return h === 'Bearer good' ? { subject: 'alice', capabilities: [] } : false
+            },
+        }
+        const h = await bootForms({
+            endpoints: { x: { folder: 'x', name: 'one', auth: verifier } },
+        })
+        try {
+            const bare = await fetch(`${h.url}/forms/x`, {
+                method: 'POST',
+                headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ a: 1 }),
+            })
+            assert.equal(bare.status, 401, 'loopback must not bypass a verifier')
+
+            const ok = await fetch(`${h.url}/forms/x`, {
+                method: 'POST',
+                headers: { 'content-type': 'application/json', authorization: 'Bearer good' },
+                body: JSON.stringify({ a: 1 }),
+            })
+            assert.equal(ok.status, 201)
+        } finally { await h.close() }
+    })
+
+    it('accepts any of several tokens on one endpoint', async () => {
+        const h = await bootForms({
+            endpoints: { x: { folder: 'x', name: 'one', auth: ['tok-a', 'tok-b'] } },
+        })
+        try {
+            for (const tok of ['tok-a', 'tok-b']) {
+                const res = await fetch(`${h.url}/forms/x`, {
+                    method: 'POST',
+                    headers: { 'content-type': 'application/json', authorization: `Bearer ${tok}` },
+                    body: JSON.stringify({ a: 1 }),
+                })
+                assert.equal(res.status, 201, `${tok} should be accepted`)
+            }
+            const bad = await fetch(`${h.url}/forms/x`, {
+                method: 'POST',
+                headers: { 'content-type': 'application/json', authorization: 'Bearer tok-c' },
+                body: JSON.stringify({ a: 1 }),
+            })
+            assert.equal(bad.status, 401)
+        } finally { await h.close() }
+    })
 })
 
 describe('forms — captcha', () => {

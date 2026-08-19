@@ -1,7 +1,7 @@
 import path from 'node:path'
 import { mkdir, writeFile } from 'node:fs/promises'
 import YAML from 'yaml'
-import { isLoopback, registerRoute } from 'mikser-io'
+import { registerRoute, resolveAuth, authorize, reachabilityOf } from 'mikser-io'
 
 // mikser-io-forms — public form-submission endpoints. POST → validation
 // + captcha → write a document file + per-submission uploaded files.
@@ -225,10 +225,10 @@ export function forms(options = {}) {
             // endpoint so a facade knows whether the path must be
             // proxied at all: any remote-open-without-token → public;
             // else any token → token; else loopback-only. Non-streaming.
-            const eps = Object.values(endpoints)
+            const reaches = Object.values(endpoints).map(reachabilityOf)
             const reachability =
-                  eps.some(ep => ep.allowRemote && !ep.token) ? 'public'
-                : eps.some(ep => ep.token)                    ? 'token'
+                  reaches.includes('public') ? 'public'
+                : reaches.includes('token')  ? 'token'
                 : 'loopback'
             registerRoute({
                 path:        base,
@@ -276,17 +276,25 @@ function makeEndpointHandler({
         async (req, res) => {
             const logger = useLogger()
             try {
-                // 1. Auth — match api plugin's uniform rule. Token wins
-                //    over loopback. No token → loopback only.
-                if (ep.token) {
-                    const auth = req.get('authorization') ?? ''
-                    const supplied = auth.startsWith('Bearer ') ? auth.slice(7) : null
-                    if (supplied !== ep.token) {
-                        return res.status(401).json({ error: 'Invalid or missing token' })
-                    }
-                } else if (ep.allowRemote !== true && !isLoopback(req.ip)) {
-                    return res.status(401).json({ error: 'Loopback only (set token or allowRemote on this endpoint to accept remote)' })
+                // 1. Auth — the engine's rule (ADR-0012), not a local copy.
+                //
+                // This endpoint used to hand-roll it, and had drifted: a
+                // configured token was required even from loopback, and the
+                // reachability denial answered 401 where api and mcp answer
+                // 403. Both now match the other two. The comment here used
+                // to claim it already matched them, which is exactly why the
+                // rule stopped being something each plugin re-implements.
+                const verifier      = resolveAuth(ep.auth ?? ep.token)
+                const trustLoopback = !ep.auth && !!ep.token
+                const outcome = await authorize(req, verifier, {
+                    allowRemote: ep.allowRemote,
+                    trustLoopback,
+                })
+                if (!outcome.ok) {
+                    if (outcome.status === 401) verifier?.challenge?.(req, res)
+                    return res.status(outcome.status).json({ error: outcome.error })
                 }
+                req.principal = outcome.principal
 
                 // Form data is whatever multer parsed + whatever
                 // express.json() / urlencoded() left on req.body.
