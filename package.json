@@ -1,6 +1,6 @@
 {
   "name": "mikser-io-forms",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "Public form-submission endpoints for mikser-io. Receives JSON or multipart/form-data over HTTP, runs validation + captcha, and writes the result as a document file plus optional file uploads. Files-as-source-of-truth — the documents/files plugins pick up the writes on their own.",
   "main": "index.js",
   "type": "module",
@@ -18,7 +18,7 @@
   },
   "homepage": "https://github.com/almero-digital-marketing/mikser-io-forms#readme",
   "peerDependencies": {
-    "mikser-io": "^9.0.0"
+    "mikser-io": "^9.4.0"
   },
   "dependencies": {
     "multer": "^2.0.0",
