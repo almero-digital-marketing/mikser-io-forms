@@ -1,7 +1,7 @@
 import path from 'node:path'
 import { mkdir, writeFile } from 'node:fs/promises'
 import YAML from 'yaml'
-import { registerRoute, resolveAuth, authorize, reachabilityOf } from 'mikser-io'
+import { registerRoute, resolveAuth, authorize, reachabilityOf, useService } from 'mikser-io'
 
 // mikser-io-forms — public form-submission endpoints. POST → validation
 // + captcha → write a document file + per-submission uploaded files.
@@ -15,7 +15,7 @@ import { registerRoute, resolveAuth, authorize, reachabilityOf } from 'mikser-io
 //     (set by the documents / files plugins). Forms can't run without
 //     those plugins also loaded.
 //   - validation can route through mikser-io-schemas if its plugin is
-//     loaded and exposes runtime.options.schemas.validate(name, data).
+//     loaded and offers the `schemas` service, whose validate(name, data)
 //
 // Per-request order: auth → multipart parse → captcha → schema/validate
 // → resolve folder & name → write uploads → write document → 201.
@@ -188,13 +188,13 @@ export function forms(options = {}) {
             // an endpoint declares schema: 'X'. If the surface isn't
             // present we throw a clear error at mount time so the
             // misconfiguration is loud, not silent at request time.
-            const schemaValidate = runtime.options.schemas?.validate
+            const schemaValidate = useService('schemas')?.validate
             for (const [name, ep] of Object.entries(endpoints)) {
                 if (ep.schema && !schemaValidate) {
                     throw new Error(
                         `forms endpoint "${name}" declares schema "${ep.schema}" but ` +
                         'mikser-io-schemas is not loaded (or did not expose ' +
-                        'runtime.options.schemas.validate).'
+                        'the schemas service).'
                     )
                 }
             }

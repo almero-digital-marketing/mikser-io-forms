@@ -6,12 +6,15 @@ import path from 'node:path'
 
 import express from 'express'
 import { forms } from '../index.js'
+import { provideService, resetServices } from 'mikser-io'
 
 // Boot a real Express app with the forms plugin attached. Returns the
 // listening server URL plus the working folder paths and a function to
 // drive the plugin's onLoaded by hand (simulating what the engine
 // would do at lifecycle time).
-async function bootForms(formsConfig, { extraRuntime = {} } = {}) {
+async function bootForms(formsConfig, { extraRuntime = {}, provideServices = {} } = {}) {
+    resetServices()
+    for (const [name, api] of Object.entries(provideServices)) provideService(name, api)
     const dir = await mkdtemp(path.join(tmpdir(), 'mikser-forms-'))
     const documentsFolder = path.join(dir, 'documents')
     const filesFolder     = path.join(dir, 'files')
@@ -394,7 +397,7 @@ describe('forms — captcha', () => {
 })
 
 describe('forms — schema integration with mikser-io-schemas', () => {
-    it('routes through runtime.options.schemas.validate', async () => {
+    it('routes through the schemas service validate', async () => {
         let called
         const h = await bootForms({
             endpoints: {
@@ -404,7 +407,8 @@ describe('forms — schema integration with mikser-io-schemas', () => {
                 },
             },
         }, {
-            extraRuntime: {
+            // Provided as a service now, the way mikser-io-schemas offers it.
+            provideServices: {
                 schemas: {
                     validate: async (name, data) => {
                         called = { name, data }
