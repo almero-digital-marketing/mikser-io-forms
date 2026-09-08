@@ -6,14 +6,40 @@ import path from 'node:path'
 
 import express from 'express'
 import { forms } from '../index.js'
-import { provideService, resetServices } from 'mikser-io'
+import { provideService, resetServices, runtime as engineRuntime } from 'mikser-io'
 
 // Boot a real Express app with the forms plugin attached. Returns the
 // listening server URL plus the working folder paths and a function to
 // drive the plugin's onLoaded by hand (simulating what the engine
 // would do at lifecycle time).
-async function bootForms(formsConfig, { extraRuntime = {}, provideServices = {} } = {}) {
+// What the plugin announced, in order, as [collection, relativePath].
+//
+// createdHook reads the runtime SINGLETON imported from mikser-io, not the
+// runtime the plugin is handed — in a build they are the same object, in a
+// test they are not — so the announcement is observed by standing in for
+// `sync` on the singleton, the way the engine's own harness does it.
+let announced = []
+function captureAnnouncements({ started = true, sync } = {}) {
+    announced = []
+    engineRuntime.started = started
+    engineRuntime.sync = sync ?? (async ({ name, context }) => {
+        announced.push([name, context?.relativePath])
+        return true
+    })
+    // A truthful sync makes createdHook schedule a real cycle, and there is no
+    // engine here to run one — the first version of this stub had the manifest
+    // throwing out of a timer a second after the test ended. The announcement
+    // is what these tests are about; what the cycle then does belongs to the
+    // engine's own suite.
+    engineRuntime.process = async () => {}
+}
+
+async function bootForms(formsConfig, { extraRuntime = {}, provideServices = {}, announce = {} } = {}) {
     resetServices()
+    // Every boot starts from a defined announcement state, so no test inherits
+    // the previous one's stub — the throwing sync below would otherwise leak
+    // into whatever ran next.
+    captureAnnouncements(announce)
     for (const [name, api] of Object.entries(provideServices)) provideService(name, api)
     const dir = await mkdtemp(path.join(tmpdir(), 'mikser-forms-'))
     const documentsFolder = path.join(dir, 'documents')
@@ -31,6 +57,10 @@ async function bootForms(formsConfig, { extraRuntime = {}, provideServices = {} 
             filesFolder,
             ...extraRuntime,
         },
+        // The engine hands the plugin its own singleton, so this mirrors what
+        // createdHook will see. Overridable, because "before the engine
+        // started" is a case worth asserting.
+        get started() { return engineRuntime.started },
     }
     const core = {
         runtime,
@@ -677,5 +707,125 @@ describe('forms — mount-time errors', () => {
             () => handlers[0](),
             /files plugin is not loaded/,
         )
+    })
+})
+
+describe('forms — a submission is announced, not left on disk', () => {
+    // The defect this covers: the plugin wrote the file and told nothing.
+    //
+    // Under `--watch` a watcher eventually noticed. Under `--server` alone —
+    // the ordinary production shape — nothing ever did: the submission sat on
+    // disk until the next restart's startup scan, while the endpoint answered
+    // `status: "queued"`. On gpoint-cms eleven submissions accumulated over 81
+    // minutes with no notification email, through 585 render cycles, because
+    // an API-triggered cycle does not import from disk. Each restart then
+    // flushed the whole backlog at once.
+    //
+    // What proves the fix is that something is TOLD. `createdHook` is what
+    // `watch()` calls from its chokidar `add` handler, so announcing it here
+    // reaches the same import path a watcher would — the plugin still writes
+    // files and still lets the source plugins read them (ADR-0002).
+    const endpoint = {
+        endpoints: {
+            contact: {
+                folder: 'contact',
+                name: () => 'fixed-name',
+                uploads: { folder: 'contact', maxFiles: 2 },
+            },
+        },
+    }
+
+    it('announces the document under its collection, with a path relative to the folder', async () => {
+        const h = await bootForms(endpoint)
+        try {
+            const res = await fetch(`${h.url}/forms/contact`, {
+                method: 'POST',
+                headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ email: 'a@b.c' }),
+            })
+            assert.equal(res.status, 201)
+            assert.deepEqual(announced, [['documents', path.join('contact', 'fixed-name.md')]],
+                'the hook name IS the collection, and the path is relative to documentsFolder')
+            assert.equal((await res.json()).status, 'queued',
+                'and only now is "queued" a true statement')
+        } finally { await h.close() }
+    })
+
+    it('announces uploads before the document that references them', async () => {
+        // The document's meta carries the paths of the files it arrived with,
+        // so this is the order in which those references resolve. Both land in
+        // one request, inside scheduleProcess's debounce, so it is a single
+        // cycle either way — the order decides only what is already in the
+        // catalog when the document is read.
+        const h = await bootForms(endpoint)
+        try {
+            const body = new FormData()
+            body.append('email', 'a@b.c')
+            body.append('attachment', new Blob(['bytes'], { type: 'text/plain' }), 'note.txt')
+            const res = await fetch(`${h.url}/forms/contact`, { method: 'POST', body })
+            assert.equal(res.status, 201, await res.text())
+
+            assert.deepEqual(announced.map(([collection]) => collection), ['files', 'documents'])
+            assert.deepEqual(announced[0], ['files', path.join('contact', 'note.txt')],
+                'an upload is announced under `files`, relative to filesFolder')
+        } finally { await h.close() }
+    })
+
+    it('never announces a path the source plugin would reject', async () => {
+        // useSource's onSync opens with `if (!context?.relativePath) return false`,
+        // and a false from sync makes createdHook skip scheduleProcess — so a
+        // malformed context is this same bug in a new costume, silent in the
+        // same way. Absolute paths are the way to get one wrong.
+        const h = await bootForms(endpoint)
+        try {
+            await fetch(`${h.url}/forms/contact`, {
+                method: 'POST',
+                headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ email: 'a@b.c' }),
+            })
+            assert.ok(announced.length,
+                'precondition: something was announced, or this asserts nothing at all')
+            for (const [collection, relativePath] of announced) {
+                assert.ok(relativePath, `${collection}: relativePath is mandatory`)
+                assert.equal(path.isAbsolute(relativePath), false,
+                    `${collection}: ${relativePath} is absolute — onSync would refuse it`)
+            }
+        } finally { await h.close() }
+    })
+
+    it('reports "written", not "queued", when the announcement throws', async () => {
+        // Still 201: the submission is validated, accepted and on disk, and
+        // the next startup scan imports it — while a 5xx would invite a retry
+        // that writes it twice. The status is the honest part.
+        const h = await bootForms(endpoint, {
+            announce: { sync: async () => { throw new Error('journal is closed') } },
+        })
+        try {
+            const res = await fetch(`${h.url}/forms/contact`, {
+                method: 'POST',
+                headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ email: 'a@b.c' }),
+            })
+            assert.equal(res.status, 201, 'the submission is not lost, so it is not an error')
+            assert.equal((await res.json()).status, 'written')
+            const written = await readFile(
+                path.join(h.documentsFolder, 'contact', 'fixed-name.md'), 'utf8')
+            assert.match(written, /a@b\.c/, 'and it really is on disk')
+        } finally { await h.close() }
+    })
+
+    it('reports "written" before the engine has started', async () => {
+        // createdHook is a no-op until then, by design — the startup scan is
+        // what imports these — so "queued" would be a promise made by nobody.
+        const h = await bootForms(endpoint, { announce: { started: false } })
+        try {
+            const res = await fetch(`${h.url}/forms/contact`, {
+                method: 'POST',
+                headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ email: 'a@b.c' }),
+            })
+            assert.equal((await res.json()).status, 'written')
+            assert.deepEqual(announced, [], 'and nothing was announced into a stopped engine')
+        } finally { await h.close() }
     })
 })

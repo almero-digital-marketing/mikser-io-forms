@@ -1,14 +1,27 @@
 import path from 'node:path'
 import { mkdir, writeFile } from 'node:fs/promises'
 import YAML from 'yaml'
-import { registerRoute, resolveAuth, authorize, reachabilityOf, useService } from 'mikser-io'
+import { registerRoute, resolveAuth, authorize, reachabilityOf, useService, createdHook } from 'mikser-io'
 
 // mikser-io-forms — public form-submission endpoints. POST → validation
 // + captcha → write a document file + per-submission uploaded files.
 // The plugin never calls createEntity; it writes to disk and lets the
-// documents / files plugins' watch loops pick the new files up. That's
-// the files-as-source-of-truth invariant (ADR-0002) — same shape decap
-// uses.
+// documents / files plugins import the new files. That's the
+// files-as-source-of-truth invariant (ADR-0002) — same shape decap uses.
+//
+// It ANNOUNCES each write, though, which it used not to. Writing and
+// waiting for a watcher to notice meant that under `--server` with no
+// `--watch` — the ordinary production shape — nothing ever noticed: the
+// submission sat on disk until the next restart's startup scan, while the
+// endpoint answered `status: "queued"`. On gpoint-cms eleven submissions
+// accumulated over 81 minutes with no notification email, through 585
+// render cycles, because an API-triggered cycle does not import from disk.
+// Every restart then flushed the whole backlog at once.
+//
+// The announcement is `createdHook(collection, { relativePath })` — exactly
+// what `watch()` calls from its chokidar `add` handler, so the import path
+// is the same one either way and the invariant above is untouched. What
+// changed is who says the file is there, not who reads it.
 //
 // Composition:
 //   - documentsFolder / filesFolder are read from runtime.options
@@ -215,7 +228,7 @@ export function forms(options = {}) {
                 router.post(`/${name}`, makeEndpointHandler({
                     name, ep, multer, schemaValidate,
                     documentsFolder, filesFolder,
-                    useLogger,
+                    useLogger, runtime,
                 }))
             }
 
@@ -249,7 +262,7 @@ export function forms(options = {}) {
 // Build the per-endpoint POST handler. Returns an Express middleware
 // chain (multer parses first, then the body handler runs).
 function makeEndpointHandler({
-    name, ep, multer, schemaValidate, documentsFolder, filesFolder, useLogger,
+    name, ep, multer, schemaValidate, documentsFolder, filesFolder, useLogger, runtime,
 }) {
     // Multer config — memory storage so we control where files land
     // after validation. Per-endpoint limits + MIME allowlist.
@@ -348,6 +361,10 @@ function makeEndpointHandler({
 
                 // 5. Write uploads (multer holds them in memory).
                 const filesWritten = []
+                // Paths to announce, kept apart from `filesWritten` because
+                // that array is the RESPONSE body — a filesystem path has no
+                // business travelling to a public form's client.
+                const uploadsToAnnounce = []
                 if (uploadsCfg && Array.isArray(req.files) && req.files.length) {
                     const uploadFolderResolved = sanitizeRelative(
                         resolve(uploadsCfg.folder, data) ?? name
@@ -367,6 +384,7 @@ function makeEndpointHandler({
                         const dest = path.join(uploadFolderAbs, uploadFileName)
                         await mkdir(path.dirname(dest), { recursive: true })
                         await writeFile(dest, f.buffer)
+                        uploadsToAnnounce.push(path.relative(filesFolder, dest))
                         filesWritten.push({
                             field: f.fieldname,
                             path: path.join('/files', uploadFolderResolved, uploadFileName),
@@ -384,15 +402,72 @@ function makeEndpointHandler({
                 const docPath = path.join(docFolderAbs, `${nameResolved}.${format}`)
                 await writeFile(docPath, buildFileBody(format, projected), 'utf8')
 
-                // 7. Respond. Entity id is what the documents plugin will
-                //    assign once its watcher picks the file up — it's
-                //    derived from the path the same way the documents
-                //    plugin's useSource does it.
+                // 7. Announce the writes, so something imports them.
+                //
+                // Uploads first, and the document after: the document's meta
+                // carries the paths of the files it came with, so this is the
+                // order in which those references resolve. Both land in the
+                // same request, well inside scheduleProcess's debounce, so it
+                // is one cycle either way — the order only decides what is
+                // already in the catalog when the document is read.
+                //
+                // `relativePath` computed against the absolute folder, the
+                // same way registerFile does it, rather than re-joining the
+                // resolved subfolder — one derivation cannot drift from the
+                // other. It is also mandatory: useSource's onSync returns
+                // false without it, and a false makes createdHook skip
+                // scheduleProcess, which is this very bug wearing a new hat.
+                //
+                // The collection is the hook name, and both are fixed in the
+                // engine — `documents` and `files` are literals in their
+                // plugins, while only the FOLDERS are configurable. That is
+                // why deriving the path from the folder is enough.
+                const announcements = [
+                    ...uploadsToAnnounce.map(relativePath => ['files', relativePath]),
+                    ['documents', path.relative(documentsFolder, docPath)],
+                ]
+
+                // 8. Respond, and only claim what happened.
+                //
+                // `queued` used to be printed unconditionally, which is what
+                // made the failure invisible: the endpoint reported success
+                // for a submission nothing would look at for hours.
+                //
+                // Still 201 when the announcement fails. The submission is
+                // validated, accepted and on disk — the next startup scan
+                // imports it, so it is not lost — and a 5xx invites a client
+                // retry, which would write it a second time. The status says
+                // `written` instead, which is the difference between "someone
+                // is about to process this" and "this is safe but idle".
                 const entityId = path.join('/documents', folderResolved, `${nameResolved}.${format}`)
-                logger.debug('forms %s: queued %s', name, entityId)
+                let status = 'queued'
+                try {
+                    // Before the engine has started, createdHook is a no-op by
+                    // design — the startup scan is what imports these — so
+                    // saying `queued` would be a promise made by nobody.
+                    if (!runtime.started) {
+                        status = 'written'
+                        logger.debug('forms %s: wrote %s before the engine started — the startup '
+                            + 'scan will import it', name, entityId)
+                    } else {
+                        for (const [collection, relativePath] of announcements) {
+                            await createdHook(collection, { relativePath })
+                        }
+                        logger.debug('forms %s: queued %s', name, entityId)
+                    }
+                } catch (err) {
+                    status = 'written'
+                    // Loud, because the submission is now in the state this
+                    // whole path exists to prevent: on disk and unannounced.
+                    logger.error(
+                        'forms %s: wrote %s but could not announce it (%s) — it will not be '
+                        + 'processed until the next startup scan',
+                        name, entityId, err.message,
+                    )
+                }
                 res.status(201).json({
                     id: entityId,
-                    status: 'queued',
+                    status,
                     uploads: filesWritten.length ? filesWritten : undefined,
                 })
             } catch (err) {
