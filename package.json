@@ -1,6 +1,6 @@
 {
   "name": "mikser-io-forms",
-  "version": "11.0.3",
+  "version": "11.0.4",
   "description": "Public form-submission endpoints for mikser-io. Receives JSON or multipart/form-data over HTTP, runs validation + captcha, and writes the result as a document file plus optional file uploads. Files-as-source-of-truth — the documents/files plugins pick up the writes on their own.",
   "main": "index.js",
   "type": "module",
