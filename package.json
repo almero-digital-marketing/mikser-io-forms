@@ -24,6 +24,9 @@
     "multer": "^2.0.0",
     "yaml": "^2.9.0"
   },
+  "allowScripts": {
+    "better-sqlite3": true
+  },
   "devDependencies": {
     "express": "^5.2.1",
     "mikser-io": "^11.5.0",
