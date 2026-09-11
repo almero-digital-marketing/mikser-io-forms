@@ -63,6 +63,10 @@ export default {
 }
 `
 
+// How long to wait for the child to say it is listening. Generous, because a
+// cold CI runner spends most of it on the first build, not on the listen.
+const BOOT_TIMEOUT_MS = 60_000
+
 async function startServer({ watch = false } = {}) {
     const dir = await mkdtemp(path.join(tmpdir(), 'mikser-forms-live-'))
     await mkdir(path.join(dir, 'layouts'), { recursive: true })
@@ -81,8 +85,11 @@ async function startServer({ watch = false } = {}) {
     await writeFile(path.join(dir, 'layouts', 'notice.hbs'),
         '<p>{{entity.meta.email}}</p>')
 
-    const port = 30000 + Math.floor(Math.random() * 20000)
-    const args = ['--no-warnings', MIKSER_APP, '--working-folder', dir, '--server', String(port)]
+    // `--server 0` asks the engine for a port nothing is using, and the log
+    // line says which. Guessing a random one and hoping used to be the shape
+    // here, and a guess that collides starts no server at all — which is how
+    // this failed in CI, twice, as an ECONNREFUSED with nothing to read.
+    const args = ['--no-warnings', MIKSER_APP, '--working-folder', dir, '--server', '0']
     if (watch) args.push('--watch')
     const proc = spawn('node', args, {
         stdio: ['ignore', 'pipe', 'pipe'],
@@ -92,11 +99,25 @@ async function startServer({ watch = false } = {}) {
     proc.stdout.on('data', (d) => { log += d.toString() })
     proc.stderr.on('data', (d) => { log += d.toString() })
 
-    // Wait for the first cycle to finish — `started` gates createdHook, so a
-    // submission before it is legitimately answered "written".
-    const deadline = Date.now() + 30_000
-    while (Date.now() < deadline && !/Mikser completed|Listening|server/i.test(log)) {
+    // Wait for the line that names the bound port. It is also the signal that
+    // the first cycle finished — `started` gates createdHook, so a submission
+    // before it is legitimately answered "written".
+    const deadline = Date.now() + BOOT_TIMEOUT_MS
+    let port = null
+    while (Date.now() < deadline) {
+        port = Number(log.match(/Server listening: http:\/\/localhost:(\d+)/)?.[1]) || null
+        if (port) break
+        if (proc.exitCode != null) break
         await new Promise(r => setTimeout(r, 100))
+    }
+    // Say WHY, with the child's own output. Reaching the fetch without a port
+    // produced `connect ECONNREFUSED 127.0.0.1:45751` and not one word about
+    // the server — so a CI failure carried no information at all, which is the
+    // one thing a test in CI has to do.
+    if (!port) {
+        throw new Error(
+            `the server never reported a port within ${BOOT_TIMEOUT_MS}ms`
+            + `${proc.exitCode != null ? ` (it exited ${proc.exitCode})` : ''}\n--- its output ---\n${log}`)
     }
     return {
         dir, port, proc,

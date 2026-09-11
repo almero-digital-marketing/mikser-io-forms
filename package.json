@@ -26,7 +26,7 @@
   },
   "devDependencies": {
     "express": "^5.2.1",
-    "mikser-io": "^11.0.1",
+    "mikser-io": "^11.5.0",
     "mikser-io-layouts": "^11.3.0"
   }
 }
