@@ -64,9 +64,11 @@ export default {
 
                     // Captcha. Omit → no verification.
                     captcha: {
-                        provider:  'google-v3',                          // 'google-v2' | 'google-v3' | 'hcaptcha' | 'turnstile'
+                        provider:  'google-v3',                          // 'google-v2' | 'google-v3' | 'hcaptcha' | 'turnstile' | 'cap'
                         secret:    process.env.RECAPTCHA_SECRET,
                         minScore:  0.5,                                  // v3 only
+                        // endpoint: 'https://cap.example.com',          // cap only — your Cap instance
+                        // siteKey:  'abc123',                           // cap only — the site key (public)
                         timeoutMs: 5000,
                         failOpen:  true,                                 // accept on network error (default true)
                         // field:  'g-recaptcha-response',               // override; provider preset sets a sensible default
@@ -131,8 +133,11 @@ Built-in:
 | `google-v3` | `g-recaptcha-response` | `https://www.google.com/recaptcha/api/siteverify` |
 | `hcaptcha` | `h-captcha-response` | `https://hcaptcha.com/siteverify` |
 | `turnstile` | `cf-turnstile-response` | `https://challenges.cloudflare.com/turnstile/v0/siteverify` |
+| `cap` | `cap-token` | `<endpoint>/<siteKey>/siteverify` |
 
-Each accepts a `secret`. `google-v3` accepts `minScore` (default `0.5`). Override the form-field name with `field`. For anything else (private corporate captcha, no-network test mock), pass a `verify(data, { req }) => boolean` function — provider / secret are ignored when `verify` is set.
+Each accepts a `secret`. `google-v3` accepts `minScore` (default `0.5`). Override the form-field name with `field`.
+
+`cap` ([tiagozip/cap](https://github.com/tiagozip/cap), self-hosted proof-of-work) additionally requires `endpoint` (base URL of your Cap instance) and `siteKey` — one Cap instance serves many sites, each with its own site key and secret. It posts `{ secret, response }` as JSON and surfaces Cap's `error` in the 403 `reason`. Cap tokens are **single-use**: a successful verification consumes the token, so after a rejected submit the page must reset the `<cap-widget>` to get a fresh one. Keep `secret` out of source — read it from the environment. For anything else (private corporate captcha, no-network test mock), pass a `verify(data, { req }) => boolean` function — provider / secret are ignored when `verify` is set.
 
 `failOpen` defaults to `true` — a provider outage doesn't take your form down. Flip to `false` if you'd rather reject than risk a brief unverified window.
 

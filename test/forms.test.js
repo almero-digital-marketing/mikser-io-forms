@@ -424,6 +424,119 @@ describe('forms — captcha', () => {
             assert.equal(res.status, 403)
         } finally { await h.close() }
     })
+
+    describe('cap provider', () => {
+        const cap = { provider: 'cap', secret: 'sec', endpoint: 'https://cap.example.test', siteKey: 'abc123' }
+
+        // Stubs only Cap's host; everything else (the harness's own requests) passes through.
+        const stubCap = (respond) => {
+            const realFetch = globalThis.fetch
+            const calls = []
+            globalThis.fetch = async (u, opts) => {
+                if (String(u).startsWith('https://cap.example.test')) {
+                    calls.push({ url: String(u), opts })
+                    return respond(opts)
+                }
+                return realFetch(u, opts)
+            }
+            return { calls, restore: () => { globalThis.fetch = realFetch } }
+        }
+        const post = (h, body) => fetch(`${h.url}/forms/x`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify(body),
+        })
+
+        it('verifies against <endpoint>/<siteKey>/siteverify with a JSON body and strips the token', async () => {
+            const h = await bootForms({ endpoints: { x: { folder: 'x', name: 'capture', captcha: cap } } })
+            const stub = stubCap(() => new Response(JSON.stringify({ success: true }), { status: 200 }))
+            try {
+                const res = await post(h, { a: 1, 'cap-token': 'abc123:id:value' })
+                assert.equal(res.status, 201)
+                assert.equal(stub.calls.length, 1)
+                assert.equal(stub.calls[0].url, 'https://cap.example.test/abc123/siteverify')
+                assert.equal(stub.calls[0].opts.method, 'POST')
+                assert.equal(stub.calls[0].opts.headers['content-type'], 'application/json')
+                assert.deepEqual(JSON.parse(stub.calls[0].opts.body), { secret: 'sec', response: 'abc123:id:value' })
+                const written = await readFile(path.join(h.documentsFolder, 'x', 'capture.md'), 'utf8')
+                assert.ok(!written.includes('cap-token'), 'token must not be persisted')
+                assert.ok(!written.includes('abc123:id:value'), 'token must not be persisted')
+            } finally { stub.restore(); await h.close() }
+        })
+
+        it('normalises a trailing slash on the endpoint', async () => {
+            const h = await bootForms({
+                endpoints: { x: { folder: 'x', name: 'capture', captcha: { ...cap, endpoint: 'https://cap.example.test//' } } },
+            })
+            const stub = stubCap(() => new Response(JSON.stringify({ success: true }), { status: 200 }))
+            try {
+                const res = await post(h, { 'cap-token': 't' })
+                assert.equal(res.status, 201)
+                assert.equal(stub.calls[0].url, 'https://cap.example.test/abc123/siteverify')
+            } finally { stub.restore(); await h.close() }
+        })
+
+        it('surfaces Cap\'s `error` in the rejection reason', async () => {
+            const h = await bootForms({ endpoints: { x: { folder: 'x', name: 'capture', captcha: cap } } })
+            const stub = stubCap(() => new Response(JSON.stringify({ success: false, error: 'Invalid token' }), { status: 403 }))
+            try {
+                const res = await post(h, { 'cap-token': 'bad' })
+                assert.equal(res.status, 403)
+                const body = await res.json()
+                assert.match(body.reason, /Invalid token/)
+            } finally { stub.restore(); await h.close() }
+        })
+
+        it('rejects a submission without the cap-token field', async () => {
+            const h = await bootForms({ endpoints: { x: { folder: 'x', name: 'capture', captcha: cap } } })
+            const stub = stubCap(() => new Response(JSON.stringify({ success: true }), { status: 200 }))
+            try {
+                const res = await post(h, { a: 1 })
+                assert.equal(res.status, 403)
+                const body = await res.json()
+                assert.match(body.reason, /cap-token/)
+                assert.equal(stub.calls.length, 0)
+            } finally { stub.restore(); await h.close() }
+        })
+
+        it('honours a custom field name', async () => {
+            const h = await bootForms({
+                endpoints: { x: { folder: 'x', name: 'capture', captcha: { ...cap, field: 'captcha' } } },
+            })
+            const stub = stubCap(() => new Response(JSON.stringify({ success: true }), { status: 200 }))
+            try {
+                const res = await post(h, { captcha: 't' })
+                assert.equal(res.status, 201)
+                assert.equal(JSON.parse(stub.calls[0].opts.body).response, 't')
+            } finally { stub.restore(); await h.close() }
+        })
+
+        it('fails open on a network error by default and closed when failOpen is false', async () => {
+            const down = () => { throw new Error('ECONNREFUSED') }
+            for (const [failOpen, status] of [[undefined, 201], [false, 403]]) {
+                const h = await bootForms({
+                    endpoints: { x: { folder: 'x', name: 'capture', captcha: { ...cap, failOpen } } },
+                })
+                const stub = stubCap(down)
+                try {
+                    const res = await post(h, { 'cap-token': 't' })
+                    assert.equal(res.status, status, `failOpen=${failOpen}`)
+                } finally { stub.restore(); await h.close() }
+            }
+        })
+
+        it('throws when endpoint or siteKey is missing', async () => {
+            for (const missing of ['endpoint', 'siteKey']) {
+                const captcha = { ...cap }
+                delete captcha[missing]
+                const h = await bootForms({ endpoints: { x: { folder: 'x', name: 'capture', captcha } } })
+                try {
+                    const res = await post(h, { 'cap-token': 't' })
+                    assert.equal(res.status, 500, `missing ${missing}`)
+                } finally { await h.close() }
+            }
+        })
+    })
 })
 
 describe('forms — schema integration with mikser-io-schemas', () => {

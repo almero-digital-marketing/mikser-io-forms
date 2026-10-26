@@ -55,11 +55,26 @@ function sanitizeRelative(p) {
 // Built-in captcha provider presets. Each returns the (field name in the
 // form, verify-url). Verification posts form-encoded `secret` + `response`
 // to the URL and reads JSON { success, score? }.
+//
+// Optional preset keys, for providers that don't fit the fixed-URL shape:
+//   url    a function of the captcha config instead of a constant
+//   needs  extra captcha.* keys the preset can't work without
+//   json   post { secret, response } as JSON rather than form-encoded
 const CAPTCHA_PROVIDERS = {
     'google-v2':  { field: 'g-recaptcha-response',  url: 'https://www.google.com/recaptcha/api/siteverify' },
     'google-v3':  { field: 'g-recaptcha-response',  url: 'https://www.google.com/recaptcha/api/siteverify' },
     'hcaptcha':   { field: 'h-captcha-response',    url: 'https://hcaptcha.com/siteverify' },
     'turnstile':  { field: 'cf-turnstile-response', url: 'https://challenges.cloudflare.com/turnstile/v0/siteverify' },
+    // Cap (https://github.com/tiagozip/cap) — self-hosted proof-of-work.
+    // One instance serves many sites, each with its own site key and secret,
+    // so the verify URL is built from the endpoint config. Cap tokens are
+    // single-use: a successful verify consumes the token.
+    'cap':        {
+        field: 'cap-token',
+        needs: ['endpoint', 'siteKey'],
+        json:  true,
+        url:   (captcha) => `${String(captcha.endpoint).replace(/\/+$/, '')}/${captcha.siteKey}/siteverify`,
+    },
 }
 
 // Verify a captcha token against the configured provider (or via a
@@ -89,6 +104,11 @@ async function verifyCaptcha(captcha, data, req, logger) {
     if (!captcha.secret) {
         throw new Error(`forms: captcha provider "${captcha.provider}" requires captcha.secret`)
     }
+    for (const key of preset.needs ?? []) {
+        if (!captcha[key]) {
+            throw new Error(`forms: captcha provider "${captcha.provider}" requires captcha.${key}`)
+        }
+    }
 
     const field = captcha.field ?? preset.field
     const token = data[field]
@@ -96,21 +116,30 @@ async function verifyCaptcha(captcha, data, req, logger) {
         return { ok: false, reason: `missing captcha field "${field}"` }
     }
 
-    const body = new URLSearchParams({
-        secret: captcha.secret,
-        response: token,
-    })
-    // Forward client IP when the engine sits behind a trusted proxy. The
-    // server plugin sets trust-proxy + req.ip walks X-Forwarded-For.
-    if (req.ip) body.append('remoteip', req.ip)
+    let body
+    const headers = {}
+    if (preset.json) {
+        // JSON providers (Cap) take { secret, response } and nothing else.
+        body = JSON.stringify({ secret: captcha.secret, response: token })
+        headers['content-type'] = 'application/json'
+    } else {
+        body = new URLSearchParams({
+            secret: captcha.secret,
+            response: token,
+        })
+        // Forward client IP when the engine sits behind a trusted proxy. The
+        // server plugin sets trust-proxy + req.ip walks X-Forwarded-For.
+        if (req.ip) body.append('remoteip', req.ip)
+    }
 
     const timeoutMs = captcha.timeoutMs ?? 5000
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), timeoutMs)
     let upstream
     try {
-        const res = await fetch(preset.url, {
+        const res = await fetch(typeof preset.url === 'function' ? preset.url(captcha) : preset.url, {
             method: 'POST',
+            headers,
             body,
             signal: controller.signal,
         })
@@ -128,7 +157,9 @@ async function verifyCaptcha(captcha, data, req, logger) {
     }
 
     if (!upstream.success) {
-        return { ok: false, reason: `captcha provider rejected: ${(upstream['error-codes'] ?? []).join(', ')}` }
+        // Google-style providers report `error-codes`; Cap reports a single `error`.
+        const codes = upstream['error-codes'] ?? [upstream.error]
+        return { ok: false, reason: `captcha provider rejected: ${codes.filter(Boolean).join(', ')}` }
     }
     // v3 score gate. score >= minScore (default 0.5) → accept.
     if (captcha.provider === 'google-v3' && typeof upstream.score === 'number') {
